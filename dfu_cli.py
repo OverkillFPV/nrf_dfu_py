@@ -138,7 +138,8 @@ async def main():
                 raise DfuException(f"Could not locate DFU Bootloader device after {max_bootloader_wait_s}s.")
 
         # Pass the custom retry count here
-        await dfu.perform_update(bootloader_device, max_retries=args.retry)
+        await dfu.perform_update(bootloader_device, max_retries=args.retry,
+                                  skip_cache_clear=already_in_bootloader)
 
     except KeyboardInterrupt:
         logger.info("\nOperation Cancelled by User.")

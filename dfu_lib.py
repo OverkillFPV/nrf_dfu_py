@@ -448,7 +448,7 @@ class NordicLegacyDFU:
 
         return False  # Jump was sent — caller should scan for new bootloader device
 
-    async def perform_update(self, device: BLEDevice, max_retries: int = 3):
+    async def perform_update(self, device: BLEDevice, max_retries: int = 3, skip_cache_clear: bool = False):
         self._log(f"Target Bootloader: {device.address}")
         self.reset_in_progress = False
 
@@ -457,7 +457,8 @@ class NordicLegacyDFU:
 
             try:
                 # Clear cache on first attempt — bootloader has different services than app mode
-                client = await self._connect_with_retry(device, clear_cache=(attempt == 0))
+                # Skip clearing if device was already in bootloader (cache is already correct)
+                client = await self._connect_with_retry(device, clear_cache=(attempt == 0 and not skip_cache_clear))
                 try:
                     self.client = client
 

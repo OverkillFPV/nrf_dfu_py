@@ -327,7 +327,7 @@ class DfuApp:
                                     "Try putting the device in DFU mode manually.")
 
             # 4. Perform Update
-            await dfu.perform_update(bootloader_device)
+            await dfu.perform_update(bootloader_device, skip_cache_clear=already_in_bootloader)
             self.log("SUCCESS! Firmware Updated.")
             messagebox.showinfo("Success", "Firmware updated successfully!")
 
