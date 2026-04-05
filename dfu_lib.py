@@ -39,6 +39,7 @@ OP_CODE_PACKET_RECEIPT_NOTIF_REQ = 0x08
 OP_CODE_RESPONSE_CODE = 0x10
 OP_CODE_PACKET_RECEIPT_NOTIF = 0x11
 OP_CODE_ENTER_BOOTLOADER = 0x01
+SECURE_DFU_RESPONSE_CODE = 0x20
 UPLOAD_MODE_SOFTDEVICE  = 0x01
 UPLOAD_MODE_BOOTLOADER  = 0x02
 UPLOAD_MODE_SD_BL       = 0x03  # SoftDevice + Bootloader combined
@@ -222,6 +223,12 @@ class NordicLegacyDFU:
             logger.debug(f"<< RX Resp: Op={request_op:#02x} Status={status}")
             await self.response_queue.put((request_op, status))
 
+        elif opcode == SECURE_DFU_RESPONSE_CODE:
+            request_op = data[1]
+            status = data[2]
+            logger.debug(f"<< RX Secure Resp: Op={request_op:#02x} Status={status}")
+            await self.response_queue.put((request_op, status))
+
         elif opcode == OP_CODE_PACKET_RECEIPT_NOTIF:
             if len(data) >= 5:
                 bytes_received = struct.unpack('<I', data[1:5])[0]
@@ -258,15 +265,14 @@ class NordicLegacyDFU:
             self._log("Connected. Discovering services...")
 
             services = client.services
-            service_uuids = [s.uuid.lower() for s in services]
             char_uuids = [c.uuid.lower() for s in services for c in s.characteristics]
 
-            logger.debug(f"Services: {service_uuids}")
             logger.debug(f"Characteristics: {char_uuids}")
 
             jump_char = None
             jump_payload = None
             jump_type = None
+            use_indications = False
 
             # Detection order matches Android DFU library:
             # 1. Secure DFU Buttonless with Bond Sharing (SDK 14+) — uses indications
@@ -274,17 +280,19 @@ class NordicLegacyDFU:
                 jump_char = BUTTONLESS_WITH_BONDS_UUID
                 jump_payload = bytearray([0x01])
                 jump_type = "Secure Buttonless (with bonds, SDK 14+)"
+                use_indications = True
             # 2. Secure DFU Buttonless without Bond Sharing (SDK 13) — uses indications
             elif BUTTONLESS_WITHOUT_BONDS_UUID.lower() in char_uuids:
                 jump_char = BUTTONLESS_WITHOUT_BONDS_UUID
                 jump_payload = bytearray([0x01])
                 jump_type = "Secure Buttonless (no bonds, SDK 13+)"
-            # 3. Legacy DFU Buttonless (SDK 6.1-11)
+                use_indications = True
+            # 3. Legacy DFU Buttonless (SDK 6.1-11) — uses notifications
             elif DFU_CONTROL_POINT_UUID.lower() in char_uuids:
                 jump_char = DFU_CONTROL_POINT_UUID
                 jump_payload = bytearray([OP_CODE_ENTER_BOOTLOADER, UPLOAD_MODE_APPLICATION])
                 jump_type = "Legacy Buttonless (SDK 6.1-11)"
-            # 4. Experimental Buttonless (SDK 12.x)
+            # 4. Experimental Buttonless (SDK 12.x) — uses notifications
             elif BUTTONLESS_EXPERIMENTAL_UUID.lower() in char_uuids:
                 jump_char = BUTTONLESS_EXPERIMENTAL_UUID
                 jump_payload = bytearray([0x01])
@@ -300,22 +308,63 @@ class NordicLegacyDFU:
 
             self._log(f"Detected: {jump_type}")
 
-            # Enable notifications/indications
+            # Clear stale responses
+            while not self.response_queue.empty():
+                self.response_queue.get_nowait()
+
+            # Step 1: Enable CCCD — exactly as Android does it.
+            # Android does: gatt.setCharacteristicNotification() + explicit descriptor write to 0x2902
+            # For indications: write [0x02, 0x00], for notifications: write [0x01, 0x00]
+            # Bleak's start_notify should handle this, but we also manually write the CCCD
+            # descriptor to ensure it's correct (especially indications vs notifications).
+            CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
+            cccd_value = bytearray([0x02, 0x00]) if use_indications else bytearray([0x01, 0x00])
+
             try:
                 await client.start_notify(jump_char, self._notification_handler)
+                self._log(f"Enabled {'indications' if use_indications else 'notifications'} on jump characteristic.")
             except Exception as e:
-                self._log(f"Could not enable notifications on jump char: {e}", logging.WARNING)
+                # Fallback: manually write the CCCD descriptor
+                self._log(f"start_notify failed ({e}), trying manual CCCD write...", logging.WARNING)
+                try:
+                    # Find the characteristic and its CCCD descriptor
+                    for s in services:
+                        for c in s.characteristics:
+                            if c.uuid.lower() == jump_char.lower():
+                                for d in c.descriptors:
+                                    if d.uuid.lower() == CCCD_UUID:
+                                        await client.write_gatt_descriptor(d.handle, cccd_value)
+                                        self._log("CCCD descriptor written manually.")
+                                        break
+                except Exception as e2:
+                    self._log(f"Manual CCCD write also failed: {e2}", logging.WARNING)
 
-            self._log(f"Sending jump command to {jump_char}...")
+            # Step 2: Write the jump command (write-with-response, same as Android)
+            self._log(f"Writing jump command to {jump_char}...")
             logger.debug(f">> TX Jump: {jump_payload.hex()}")
             write_attempted = True
             try:
                 await client.write_gatt_char(jump_char, jump_payload, response=True)
+                self._log("Jump write acknowledged by device.")
             except Exception as e:
-                logger.debug(f"Write exception (may be expected): {e}")
+                logger.debug(f"Write exception (may be expected if device rebooted): {e}")
 
-            self._log("Jump command sent. Device rebooting...")
-            await asyncio.sleep(0.5)  # Brief pause to let device process before we disconnect
+            # Step 3: Wait for notification/indication response — Android does this!
+            # Response format: [0x20, 0x01, 0x01] for secure, [0x10, 0x01, 0x01] for legacy
+            # The device confirms it accepted the jump command before rebooting.
+            # On weak signals this is critical — without waiting, we disconnect too early.
+            try:
+                resp_op = 0x01  # The enter-bootloader op code we sent
+                status = await self._wait_for_response(resp_op, timeout=10.0)
+                if status == 1:
+                    self._log("Device confirmed jump. Rebooting into bootloader...")
+                else:
+                    self._log(f"Jump response status={status}, proceeding anyway.")
+            except Exception:
+                self._log("No jump response received (device may have rebooted already).")
+
+            # Step 4: Disconnect (Android does waitFor(500) then disconnect for buttonless-without-bonds)
+            await asyncio.sleep(0.5)
             try:
                 await client.disconnect()
             except Exception:
