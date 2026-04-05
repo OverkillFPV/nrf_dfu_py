@@ -256,36 +256,49 @@ class NordicLegacyDFU:
                 self._log(f"Timeout ({timeout}s) waiting for response to op={expected_op_code:#02x}", logging.ERROR)
                 return -1
 
-    async def _connect_with_retry(self, device, max_retries=3):
+    async def _clear_ble_cache(self, address: str):
+        """Clear BlueZ GATT cache for a device (Linux only). Equivalent to Android's refreshDeviceCache()."""
+        import platform
+        if platform.system() != "Linux":
+            return
+        try:
+            import subprocess
+            # Remove the device from BlueZ to clear its cached services
+            result = subprocess.run(
+                ["bluetoothctl", "remove", address],
+                timeout=5, capture_output=True, text=True
+            )
+            logger.debug(f"bluetoothctl remove {address}: {result.stdout.strip()} {result.stderr.strip()}")
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.debug(f"Cache clear failed (non-fatal): {e}")
+
+    async def _connect_with_retry(self, device, max_retries=3, clear_cache=False):
         """Connect to a device with retries, handling BlueZ cache issues on Linux."""
+        if clear_cache:
+            await self._clear_ble_cache(device.address)
+
         for attempt in range(max_retries):
             try:
                 client = BleakClient(device, timeout=30.0, adapter=self.adapter)
                 await client.connect()
                 # Verify services were discovered
                 if not client.services or len(list(client.services)) == 0:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
                     raise BleakError("No services discovered")
                 return client
             except Exception as e:
+                self._log(f"Connection attempt {attempt+1}/{max_retries} failed: {e}", logging.WARNING)
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
                 if attempt < max_retries - 1:
-                    self._log(f"Connection attempt {attempt+1} failed: {e}. Retrying...", logging.WARNING)
-                    # On Linux/BlueZ, clear the device cache between retries
-                    try:
-                        if hasattr(client, '_backend') and hasattr(client._backend, '_bus'):
-                            import subprocess
-                            addr = device.address
-                            path = f"/org/bluez/hci0/dev_{addr.replace(':', '_')}"
-                            subprocess.run(["dbus-send", "--system", "--dest=org.bluez",
-                                            "--type=method_call", path,
-                                            "org.bluez.Device1.Connect"], timeout=5,
-                                           capture_output=True)
-                            await asyncio.sleep(1.0)
-                            subprocess.run(["dbus-send", "--system", "--dest=org.bluez",
-                                            "--type=method_call", path,
-                                            "org.bluez.Device1.Disconnect"], timeout=5,
-                                           capture_output=True)
-                    except Exception:
-                        pass
+                    # Clear cache before retrying — stale GATT data is the most common cause
+                    await self._clear_ble_cache(device.address)
                     await asyncio.sleep(2.0)
                 else:
                     raise
@@ -418,8 +431,9 @@ class NordicLegacyDFU:
             self._log(f"DFU connection attempt {attempt+1}/{max_retries}...")
 
             try:
-                client = await self._connect_with_retry(device)
-                async with client:
+                # Clear cache on first attempt — bootloader has different services than app mode
+                client = await self._connect_with_retry(device, clear_cache=(attempt == 0))
+                try:
                     self.client = client
 
                     await client.start_notify(DFU_CONTROL_POINT_UUID, self._notification_handler)
@@ -491,6 +505,12 @@ class NordicLegacyDFU:
                     await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_ACTIVATE_AND_RESET]), response=True)
                     self._log("DFU Complete.")
                     return # SUCCESS
+
+                finally:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
 
             except Exception as e:
                 if self.reset_in_progress:
