@@ -444,6 +444,9 @@ class NordicLegacyDFU:
             else:
                 self._log(f"Jump connection failed: {e}", logging.WARNING)
                 self._log("Will still scan for bootloader (device may already be in DFU mode).", logging.WARNING)
+                return True  # Connection failed — assume device might already be in bootloader
+
+        return False  # Jump was sent — caller should scan for new bootloader device
 
     async def perform_update(self, device: BLEDevice, max_retries: int = 3):
         self._log(f"Target Bootloader: {device.address}")

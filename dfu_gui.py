@@ -287,40 +287,44 @@ class DfuApp:
             dfu.parse_zip()
 
             # 2. Jump to Bootloader
-            await dfu.jump_to_bootloader(device)
+            already_in_bootloader = await dfu.jump_to_bootloader(device)
 
-            self.log("Waiting for bootloader to appear...")
-            await asyncio.sleep(3.0)
+            if already_in_bootloader:
+                self.log("Device is already in bootloader mode. Proceeding directly to update...")
+                bootloader_device = device
+            else:
+                self.log("Waiting for bootloader to appear...")
+                await asyncio.sleep(3.0)
 
-            # 3. Find Bootloader — retry loop matching CLI behaviour
-            bootloader_identifiers = ["DfuTarg", "DFU"]
-            original_mac = device.address
-            if ":" in original_mac and len(original_mac) == 17:
-                try:
-                    prefix = original_mac[:-2]
-                    last_byte = int(original_mac[-2:], 16)
-                    last_byte = (last_byte + 1) & 0xFF
-                    bootloader_identifiers.append(f"{prefix}{last_byte:02X}")
-                except Exception:
-                    pass
+                # 3. Find Bootloader — retry loop matching CLI behaviour
+                bootloader_identifiers = ["DfuTarg", "DFU"]
+                original_mac = device.address
+                if ":" in original_mac and len(original_mac) == 17:
+                    try:
+                        prefix = original_mac[:-2]
+                        last_byte = int(original_mac[-2:], 16)
+                        last_byte = (last_byte + 1) & 0xFF
+                        bootloader_identifiers.append(f"{prefix}{last_byte:02X}")
+                    except Exception:
+                        pass
 
-            bootloader_device = None
-            max_bootloader_wait_s = 30
-            scan_interval_s = 3.0
-            scan_attempts = int(max_bootloader_wait_s / scan_interval_s)
-            for attempt in range(scan_attempts):
-                self.log(f"Scanning for Bootloader... (attempt {attempt + 1}/{scan_attempts})")
-                try:
-                    bootloader_device = await find_any_device(
-                        bootloader_identifiers, service_uuids=[DFU_SERVICE_UUID, SECURE_DFU_SERVICE_UUID])
-                    break
-                except DfuException:
-                    if attempt < scan_attempts - 1:
-                        await asyncio.sleep(scan_interval_s)
+                bootloader_device = None
+                max_bootloader_wait_s = 30
+                scan_interval_s = 3.0
+                scan_attempts = int(max_bootloader_wait_s / scan_interval_s)
+                for attempt in range(scan_attempts):
+                    self.log(f"Scanning for Bootloader... (attempt {attempt + 1}/{scan_attempts})")
+                    try:
+                        bootloader_device = await find_any_device(
+                            bootloader_identifiers, service_uuids=[DFU_SERVICE_UUID, SECURE_DFU_SERVICE_UUID])
+                        break
+                    except DfuException:
+                        if attempt < scan_attempts - 1:
+                            await asyncio.sleep(scan_interval_s)
 
-            if not bootloader_device:
-                raise Exception(f"Could not locate Bootloader device after {max_bootloader_wait_s}s. "
-                                "Try putting the device in DFU mode manually.")
+                if not bootloader_device:
+                    raise Exception(f"Could not locate Bootloader device after {max_bootloader_wait_s}s. "
+                                    "Try putting the device in DFU mode manually.")
 
             # 4. Perform Update
             await dfu.perform_update(bootloader_device)
