@@ -237,25 +237,51 @@ class NordicLegacyDFU:
                 self._log(f"Timeout ({timeout}s) waiting for response to op={expected_op_code:#02x}", logging.ERROR)
                 return -1
 
-    async def jump_to_bootloader(self, device: BLEDevice):
-        self._log(f"Connecting to {device.name} ({device.address}) for Jump...")
-        try:
-            async with BleakClient(device, adapter=self.adapter) as client:
-                self.client = client
-                await client.start_notify(DFU_CONTROL_POINT_UUID, self._notification_handler)
-                mtu = await self._setup_mtu()
-                self._log(f"Connected. MTU: {mtu}")
+    async def jump_to_bootloader(self, device: BLEDevice, max_retries: int = 3):
+        for attempt in range(max_retries):
+            self._log(f"Connecting to {device.name} ({device.address}) for Jump (attempt {attempt+1}/{max_retries})...")
+            try:
+                async with BleakClient(device, timeout=20.0, adapter=self.adapter) as client:
+                    self.client = client
+                    # Clear any stale responses from a previous attempt
+                    while not self.response_queue.empty():
+                        self.response_queue.get_nowait()
 
-                payload = bytearray([OP_CODE_ENTER_BOOTLOADER, UPLOAD_MODE_APPLICATION])
+                    await client.start_notify(DFU_CONTROL_POINT_UUID, self._notification_handler)
+                    await asyncio.sleep(0.3)  # Let notifications settle before writing
+                    mtu = await self._setup_mtu()
+                    self._log(f"Connected. MTU: {mtu}")
 
-                logger.debug(f">> TX Jump: {payload.hex()}")
-                try:
+                    payload = bytearray([OP_CODE_ENTER_BOOTLOADER, UPLOAD_MODE_APPLICATION])
+                    logger.debug(f">> TX Jump: {payload.hex()}")
                     await client.write_gatt_char(DFU_CONTROL_POINT_UUID, payload, response=True)
-                except Exception:
-                    pass
-                self._log("Jump command sent.")
-        except Exception as e:
-            self._log(f"Jump connection sequence ended: {e}")
+
+                    # Wait for the device to acknowledge the jump command.
+                    # The device will disconnect immediately after responding, so a
+                    # connection drop here is normal and means the jump succeeded.
+                    try:
+                        status = await self._wait_for_response(OP_CODE_ENTER_BOOTLOADER, timeout=5.0)
+                        if status == 1:
+                            self._log("Jump command acknowledged. Device rebooting...")
+                        else:
+                            self._log(f"Jump command returned status {status}, continuing anyway.")
+                    except Exception:
+                        pass  # Disconnect during response wait is expected
+
+                self._log("Jump complete.")
+                return  # Success
+
+            except Exception as e:
+                err = str(e)
+                # A disconnect/reset mid-command means the jump worked
+                if any(k in err.lower() for k in ("disconnect", "reset", "connection", "closed", "not connected")):
+                    self._log("Device disconnected during jump — reboot triggered.")
+                    return
+                self._log(f"Jump attempt {attempt+1} failed: {e}", logging.WARNING)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2.0)
+                else:
+                    self._log("Could not send jump command. Will still scan for bootloader.", logging.WARNING)
 
     async def perform_update(self, device: BLEDevice, max_retries: int = 3):
         self._log(f"Target Bootloader: {device.address}")
