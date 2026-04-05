@@ -217,18 +217,25 @@ class NordicLegacyDFU:
             self.pkg_receipt_event.set()
 
     async def _wait_for_response(self, expected_op_code, timeout=30.0):
-        try:
-            request_op, status = await asyncio.wait_for(self.response_queue.get(), timeout)
-            if request_op != expected_op_code:
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                self._log(f"Timeout ({timeout}s) waiting for response to op={expected_op_code:#02x}", logging.ERROR)
                 return -1
-
-            if status != 1: # 1 = SUCCESS
-                self._log(f"<< RX Error: Command {expected_op_code:#02x} failed with status {status}", logging.ERROR)
-                return status
-            return 1
-        except asyncio.TimeoutError:
-            self._log(f"Timeout ({timeout}s) waiting for response", logging.ERROR)
-            return -1
+            try:
+                request_op, status = await asyncio.wait_for(self.response_queue.get(), remaining)
+                if request_op != expected_op_code:
+                    logger.debug(f"Discarding stale response op={request_op:#02x}, waiting for {expected_op_code:#02x}")
+                    continue
+                if status != 1:  # 1 = SUCCESS
+                    self._log(f"<< RX Error: Command {expected_op_code:#02x} failed with status {status}", logging.ERROR)
+                    return status
+                return 1
+            except asyncio.TimeoutError:
+                self._log(f"Timeout ({timeout}s) waiting for response to op={expected_op_code:#02x}", logging.ERROR)
+                return -1
 
     async def jump_to_bootloader(self, device: BLEDevice):
         self._log(f"Connecting to {device.name} ({device.address}) for Jump...")
@@ -262,6 +269,7 @@ class NordicLegacyDFU:
                     self.client = client
 
                     await client.start_notify(DFU_CONTROL_POINT_UUID, self._notification_handler)
+                    await asyncio.sleep(0.5)  # Allow device to settle after reboot before issuing commands
 
                     mtu = await self._setup_mtu()
                     self._log(f"Connected to Bootloader. MTU: {mtu}")
@@ -291,6 +299,7 @@ class NordicLegacyDFU:
                     self._log("Sending Init Packet...")
                     await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_INIT_DFU_PARAMS, 0x00]), response=True)
                     await client.write_gatt_char(DFU_PACKET_UUID, self.dat_data, response=False)
+                    await asyncio.sleep(0.1)  # Ensure WriteWithoutResponse is delivered before end-init command
                     await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_INIT_DFU_PARAMS, 0x01]), response=True)
 
                     status = await self._wait_for_response(OP_CODE_INIT_DFU_PARAMS)
@@ -350,7 +359,7 @@ class NordicLegacyDFU:
         total_bytes = len(self.bin_data)
         packets_since_prn = 0
         self.bytes_sent = 0
-        prn_timeout = max(0.8, self.prn * 0.08) # Estimate timeout based on PRN
+        prn_timeout = max(3.0, self.prn * 0.3)  # Conservative: 0.3s/packet, min 3s
         self._log(f"PRN Timeout set to {prn_timeout:.2f} seconds")
 
         self._log(f"Uploading {total_bytes} bytes...")
@@ -422,31 +431,24 @@ async def find_device_by_name_or_address(name_or_address: str, force_scan: bool,
 async def find_any_device(identifiers: List[str], adapter: str = None, service_uuid: str = None) -> BLEDevice:
     """
     Scans once and checks if ANY of the provided identifiers match found devices.
-    Returns the first device that matches.
+    Returns the first device that matches by address, name, or service UUID.
     """
     scanner = BleakScanner(adapter=adapter)
-    # Perform a single broadcast scan
     scanned_devices = await scanner.discover(timeout=5.0, return_adv=True)
 
-    for identifier in identifiers:
-        identifier_upper = identifier.upper()
+    for key, (d, adv) in scanned_devices.items():
+        adv_name = (adv.local_name or d.name or "")
+        adv_name_upper = adv_name.upper()
 
-        for key, (d, adv) in scanned_devices.items():
-            # 1. Check Address Match
-            if d.address.upper() == identifier_upper:
+        # 1. Check service UUID (highest confidence — catches DFU bootloader regardless of name)
+        if service_uuid and service_uuid.lower() in [u.lower() for u in adv.service_uuids]:
+            return d
+
+        # 2. Check address or name against all provided identifiers
+        for identifier in identifiers:
+            if d.address.upper() == identifier.upper():
                 return d
-
-            # 2. Check Name Match
-            adv_name = adv.local_name or d.name or ""
-            if adv_name == identifier:
+            if adv_name_upper == identifier.upper():
                 return d
-
-            # 3. Check Service UUID (only if identifier matches special UUID string if applicable)
-            # (Logic handled separately usually, but here checking generally)
-            if service_uuid and service_uuid.lower() in [u.lower() for u in adv.service_uuids]:
-                # This is a bit ambiguous if multiple devices have the UUID,
-                # but this function targets specific identifiers.
-                # If identifier was "DFU_SERVICE", it would catch here.
-                pass
 
     raise DfuException(f"No devices found matching: {identifiers}")

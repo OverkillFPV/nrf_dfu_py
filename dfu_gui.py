@@ -13,7 +13,7 @@ from datetime import datetime
 from bleak import BleakScanner
 
 import dfu_lib
-from dfu_lib import NordicLegacyDFU, DFU_SERVICE_UUID
+from dfu_lib import NordicLegacyDFU, DFU_SERVICE_UUID, find_any_device, DfuException
 
 class AsyncHelper:
     def __init__(self):
@@ -72,7 +72,7 @@ class DfuApp:
         self.spin_timeout.grid(row=0, column=4, sticky="w")
 
         # High MTU
-        self.high_mtu_var = tk.BooleanVar(value=False)
+        self.high_mtu_var = tk.BooleanVar(value=True)
         self.chk_high_mtu = ttk.Checkbutton(settings_frame, text="High MTU", variable=self.high_mtu_var)
         self.chk_high_mtu.grid(row=1, column=0, sticky="w", padx=5, pady=(4, 0))
         if is_macos:
@@ -144,7 +144,10 @@ class DfuApp:
         self.root.after(0, lambda: self.progress_var.set(pct))
 
     def browse_file(self):
-        filename = filedialog.askopenfilename(filetypes=[("Zip Files", "*.zip")])
+        initial_dir = os.path.dirname(os.path.abspath(__file__))
+        filename = filedialog.askopenfilename(
+            initialdir=initial_dir,
+            filetypes=[("Zip Files", "*.zip")])
         if filename:
             self.file_path_var.set(filename)
             self.check_ready()
@@ -286,41 +289,38 @@ class DfuApp:
             # 2. Jump to Bootloader
             await dfu.jump_to_bootloader(device)
 
-            self.log("Waiting for reboot (5s)...")
-            await asyncio.sleep(5.0)
+            self.log("Waiting for bootloader to appear...")
+            await asyncio.sleep(3.0)
 
-            # 3. Find Bootloader
-            self.log("Scanning for Bootloader...")
+            # 3. Find Bootloader — retry loop matching CLI behaviour
+            bootloader_identifiers = ["DfuTarg", "DFU"]
+            original_mac = device.address
+            if ":" in original_mac and len(original_mac) == 17:
+                try:
+                    prefix = original_mac[:-2]
+                    last_byte = int(original_mac[-2:], 16)
+                    last_byte = (last_byte + 1) & 0xFF
+                    bootloader_identifiers.append(f"{prefix}{last_byte:02X}")
+                except Exception:
+                    pass
+
             bootloader_device = None
-
-            # A. Try searching for DFU Service UUID
-            try:
-                bootloader_device = await dfu_lib.find_device_by_name_or_address(
-                    "DFU",
-                    force_scan=force_scan,
-                    service_uuid=DFU_SERVICE_UUID
-                )
-            except Exception:
-                pass
-
-            # B. Try MAC Address Hint (Increment last byte)
-            if not bootloader_device:
-                original_mac = device.address
-                if ":" in original_mac and len(original_mac) == 17:
-                    try:
-                        prefix = original_mac[:-2]
-                        last_byte = int(original_mac[-2:], 16)
-                        last_byte = (last_byte + 1) & 0xFF
-                        bootloader_mac_hint = f"{prefix}{last_byte:02X}"
-                        self.log(f"Trying Address Hint: {bootloader_mac_hint}")
-                        bootloader_device = await dfu_lib.find_device_by_name_or_address(
-                            bootloader_mac_hint,
-                            force_scan=force_scan
-                        )
-                    except: pass
+            max_bootloader_wait_s = 30
+            scan_interval_s = 3.0
+            scan_attempts = int(max_bootloader_wait_s / scan_interval_s)
+            for attempt in range(scan_attempts):
+                self.log(f"Scanning for Bootloader... (attempt {attempt + 1}/{scan_attempts})")
+                try:
+                    bootloader_device = await find_any_device(
+                        bootloader_identifiers, service_uuid=DFU_SERVICE_UUID)
+                    break
+                except DfuException:
+                    if attempt < scan_attempts - 1:
+                        await asyncio.sleep(scan_interval_s)
 
             if not bootloader_device:
-                raise Exception("Could not locate Bootloader device. Try putting device in DFU mode manually.")
+                raise Exception(f"Could not locate Bootloader device after {max_bootloader_wait_s}s. "
+                                "Try putting the device in DFU mode manually.")
 
             # 4. Perform Update
             await dfu.perform_update(bootloader_device)
