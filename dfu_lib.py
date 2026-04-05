@@ -241,40 +241,32 @@ class NordicLegacyDFU:
         for attempt in range(max_retries):
             self._log(f"Connecting to {device.name} ({device.address}) for Jump (attempt {attempt+1}/{max_retries})...")
             try:
-                async with BleakClient(device, timeout=20.0, adapter=self.adapter) as client:
-                    self.client = client
-                    # Clear any stale responses from a previous attempt
-                    while not self.response_queue.empty():
-                        self.response_queue.get_nowait()
+                client = BleakClient(device, timeout=20.0, adapter=self.adapter)
+                await client.connect()
+                self._log("Connected. Sending jump command...")
 
-                    await client.start_notify(DFU_CONTROL_POINT_UUID, self._notification_handler)
-                    await asyncio.sleep(0.3)  # Let notifications settle before writing
-                    mtu = await self._setup_mtu()
-                    self._log(f"Connected. MTU: {mtu}")
+                await client.start_notify(DFU_CONTROL_POINT_UUID, self._notification_handler)
 
-                    payload = bytearray([OP_CODE_ENTER_BOOTLOADER, UPLOAD_MODE_APPLICATION])
-                    logger.debug(f">> TX Jump: {payload.hex()}")
+                payload = bytearray([OP_CODE_ENTER_BOOTLOADER, UPLOAD_MODE_APPLICATION])
+                logger.debug(f">> TX Jump: {payload.hex()}")
+                try:
                     await client.write_gatt_char(DFU_CONTROL_POINT_UUID, payload, response=True)
+                except Exception:
+                    pass  # Device may disconnect mid-write — that means jump succeeded
 
-                    # Wait for the device to acknowledge the jump command.
-                    # The device will disconnect immediately after responding, so a
-                    # connection drop here is normal and means the jump succeeded.
-                    try:
-                        status = await self._wait_for_response(OP_CODE_ENTER_BOOTLOADER, timeout=5.0)
-                        if status == 1:
-                            self._log("Jump command acknowledged. Device rebooting...")
-                        else:
-                            self._log(f"Jump command returned status {status}, continuing anyway.")
-                    except Exception:
-                        pass  # Disconnect during response wait is expected
-
-                self._log("Jump complete.")
+                # Don't wait for notification — Android doesn't either.
+                # The device reboots into bootloader immediately.
+                self._log("Jump command sent. Device rebooting...")
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass  # Already disconnected
                 return  # Success
 
             except Exception as e:
-                err = str(e)
+                err = str(e).lower()
                 # A disconnect/reset mid-command means the jump worked
-                if any(k in err.lower() for k in ("disconnect", "reset", "connection", "closed", "not connected")):
+                if any(k in err for k in ("disconnect", "reset", "closed", "not connected")):
                     self._log("Device disconnected during jump — reboot triggered.")
                     return
                 self._log(f"Jump attempt {attempt+1} failed: {e}", logging.WARNING)
@@ -317,9 +309,13 @@ class NordicLegacyDFU:
                     await client.write_gatt_char(DFU_PACKET_UUID, size_payload, response=False)
 
                     status = await self._wait_for_response(OP_CODE_START_DFU, timeout=60.0)
+                    if status == 2:  # INVALID_STATE — stale DFU from previous attempt
+                        self._log("Bootloader in INVALID_STATE, resetting and retrying...", logging.WARNING)
+                        await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_RESET]), response=True)
+                        raise DfuException("INVALID_STATE — reset sent, will retry")
                     if status != 1:
                         await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_RESET]), response=True)
-                        raise DfuException("Start DFU sequence failed")
+                        raise DfuException(f"Start DFU sequence failed with status {status}")
 
                     # Init Packet
                     self._log("Sending Init Packet...")
@@ -378,8 +374,7 @@ class NordicLegacyDFU:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
                 mtu = self.client.mtu_size if self.client else 23
-        chunk_size = min(mtu - 3, 244)  # ATT overhead, cap at 244
-        if chunk_size < 20: chunk_size = 20
+        chunk_size = max(mtu - 3, 20)  # ATT overhead, floor at 20
         self._log(f"Using chunk_size = {chunk_size}")
         self._last_progress_block = -1
         total_bytes = len(self.bin_data)
