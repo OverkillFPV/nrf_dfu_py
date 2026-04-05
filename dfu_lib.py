@@ -12,9 +12,21 @@ from bleak import BleakScanner, BleakClient, BleakError
 from bleak.backends.device import BLEDevice
 
 # --- UUID Constants ---
+# Legacy DFU (SDK 4.3 - 11)
 DFU_SERVICE_UUID = "00001530-1212-efde-1523-785feabcd123"
 DFU_CONTROL_POINT_UUID = "00001531-1212-efde-1523-785feabcd123"
 DFU_PACKET_UUID = "00001532-1212-efde-1523-785feabcd123"
+DFU_VERSION_UUID = "00001534-1212-efde-1523-785feabcd123"
+
+# Secure DFU (SDK 12+)
+SECURE_DFU_SERVICE_UUID = "0000fe59-0000-1000-8000-00805f9b34fb"
+SECURE_DFU_CONTROL_POINT_UUID = "8ec90001-f315-4f60-9fb8-838830daea50"
+SECURE_DFU_PACKET_UUID = "8ec90002-f315-4f60-9fb8-838830daea50"
+
+# Buttonless DFU characteristics (for jumping from app mode to bootloader)
+BUTTONLESS_WITHOUT_BONDS_UUID = "8ec90003-f315-4f60-9fb8-838830daea50"
+BUTTONLESS_WITH_BONDS_UUID = "8ec90004-f315-4f60-9fb8-838830daea50"
+BUTTONLESS_EXPERIMENTAL_UUID = "8e400001-f315-4f60-9fb8-838830daea50"
 
 # --- Op Codes ---
 OP_CODE_START_DFU = 0x01
@@ -243,30 +255,74 @@ class NordicLegacyDFU:
         try:
             client = BleakClient(device, timeout=20.0, adapter=self.adapter)
             await client.connect()
-            self._log("Connected. Sending jump command...")
+            self._log("Connected. Discovering services...")
 
+            services = client.services
+            service_uuids = [s.uuid.lower() for s in services]
+            char_uuids = [c.uuid.lower() for s in services for c in s.characteristics]
+
+            logger.debug(f"Services: {service_uuids}")
+            logger.debug(f"Characteristics: {char_uuids}")
+
+            jump_char = None
+            jump_payload = None
+            jump_type = None
+
+            # Detection order matches Android DFU library:
+            # 1. Secure DFU Buttonless with Bond Sharing (SDK 14+) — uses indications
+            if BUTTONLESS_WITH_BONDS_UUID.lower() in char_uuids:
+                jump_char = BUTTONLESS_WITH_BONDS_UUID
+                jump_payload = bytearray([0x01])
+                jump_type = "Secure Buttonless (with bonds, SDK 14+)"
+            # 2. Secure DFU Buttonless without Bond Sharing (SDK 13) — uses indications
+            elif BUTTONLESS_WITHOUT_BONDS_UUID.lower() in char_uuids:
+                jump_char = BUTTONLESS_WITHOUT_BONDS_UUID
+                jump_payload = bytearray([0x01])
+                jump_type = "Secure Buttonless (no bonds, SDK 13+)"
+            # 3. Legacy DFU Buttonless (SDK 6.1-11)
+            elif DFU_CONTROL_POINT_UUID.lower() in char_uuids:
+                jump_char = DFU_CONTROL_POINT_UUID
+                jump_payload = bytearray([OP_CODE_ENTER_BOOTLOADER, UPLOAD_MODE_APPLICATION])
+                jump_type = "Legacy Buttonless (SDK 6.1-11)"
+            # 4. Experimental Buttonless (SDK 12.x)
+            elif BUTTONLESS_EXPERIMENTAL_UUID.lower() in char_uuids:
+                jump_char = BUTTONLESS_EXPERIMENTAL_UUID
+                jump_payload = bytearray([0x01])
+                jump_type = "Experimental Buttonless (SDK 12.x)"
+
+            if not jump_char:
+                self._log("No buttonless DFU characteristic found. Device may already be in bootloader mode.", logging.WARNING)
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                return
+
+            self._log(f"Detected: {jump_type}")
+
+            # Enable notifications/indications
             try:
-                await client.start_notify(DFU_CONTROL_POINT_UUID, self._notification_handler)
-            except Exception:
-                pass  # Notifications are optional for the jump — write alone triggers reboot
+                await client.start_notify(jump_char, self._notification_handler)
+            except Exception as e:
+                self._log(f"Could not enable notifications on jump char: {e}", logging.WARNING)
 
-            payload = bytearray([OP_CODE_ENTER_BOOTLOADER, UPLOAD_MODE_APPLICATION])
-            logger.debug(f">> TX Jump: {payload.hex()}")
+            self._log(f"Sending jump command to {jump_char}...")
+            logger.debug(f">> TX Jump: {jump_payload.hex()}")
             write_attempted = True
             try:
-                await client.write_gatt_char(DFU_CONTROL_POINT_UUID, payload, response=True)
-            except Exception:
-                pass  # Device may disconnect mid-write — that means jump succeeded
+                await client.write_gatt_char(jump_char, jump_payload, response=True)
+            except Exception as e:
+                logger.debug(f"Write exception (may be expected): {e}")
 
             self._log("Jump command sent. Device rebooting...")
+            await asyncio.sleep(0.5)  # Brief pause to let device process before we disconnect
             try:
                 await client.disconnect()
             except Exception:
-                pass  # Already disconnected
+                pass
 
         except Exception as e:
             if write_attempted:
-                # Write was sent — device likely rebooted causing this exception
                 self._log(f"Device disconnected after jump command (expected): {e}")
             else:
                 self._log(f"Jump connection failed: {e}", logging.WARNING)
@@ -446,21 +502,32 @@ async def find_device_by_name_or_address(name_or_address: str, force_scan: bool,
 
     return target
 
-async def find_any_device(identifiers: List[str], adapter: str = None, service_uuid: str = None) -> BLEDevice:
+async def find_any_device(identifiers: List[str], adapter: str = None, service_uuid: str = None, service_uuids: List[str] = None) -> BLEDevice:
     """
     Scans once and checks if ANY of the provided identifiers match found devices.
     Returns the first device that matches by address, name, or service UUID.
+    Accepts either a single service_uuid or a list of service_uuids.
     """
+    # Normalize to a list
+    match_uuids = []
+    if service_uuids:
+        match_uuids = [u.lower() for u in service_uuids]
+    elif service_uuid:
+        match_uuids = [service_uuid.lower()]
+
     scanner = BleakScanner(adapter=adapter)
     scanned_devices = await scanner.discover(timeout=5.0, return_adv=True)
 
     for key, (d, adv) in scanned_devices.items():
         adv_name = (adv.local_name or d.name or "")
         adv_name_upper = adv_name.upper()
+        adv_svc_uuids = [u.lower() for u in adv.service_uuids]
 
-        # 1. Check service UUID (highest confidence — catches DFU bootloader regardless of name)
-        if service_uuid and service_uuid.lower() in [u.lower() for u in adv.service_uuids]:
-            return d
+        # 1. Check service UUIDs (highest confidence — catches DFU bootloader regardless of name)
+        if match_uuids:
+            for mu in match_uuids:
+                if mu in adv_svc_uuids:
+                    return d
 
         # 2. Check address or name against all provided identifiers
         for identifier in identifiers:

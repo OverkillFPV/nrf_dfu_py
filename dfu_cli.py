@@ -10,7 +10,7 @@ import platform
 
 
 # Update import to include the new find_any_device function
-from dfu_lib import NordicLegacyDFU, find_any_device, DfuException, DFU_SERVICE_UUID
+from dfu_lib import NordicLegacyDFU, find_any_device, DfuException, DFU_SERVICE_UUID, SECURE_DFU_SERVICE_UUID
 
 # --- Custom Logger for CLI ---
 class MsFormatter(logging.Formatter):
@@ -124,7 +124,7 @@ async def main():
         for attempt in range(scan_attempts):
             logger.info(f"Scanning for Bootloader... (attempt {attempt + 1}/{scan_attempts})")
             try:
-                bootloader_device = await find_any_device(bootloader_identifiers, adapter=args.adapter, service_uuid=DFU_SERVICE_UUID)
+                bootloader_device = await find_any_device(bootloader_identifiers, adapter=args.adapter, service_uuids=[DFU_SERVICE_UUID, SECURE_DFU_SERVICE_UUID])
                 break
             except DfuException:
                 if attempt < scan_attempts - 1:

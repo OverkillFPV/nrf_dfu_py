@@ -13,7 +13,7 @@ from datetime import datetime
 from bleak import BleakScanner
 
 import dfu_lib
-from dfu_lib import NordicLegacyDFU, DFU_SERVICE_UUID, find_any_device, DfuException
+from dfu_lib import NordicLegacyDFU, DFU_SERVICE_UUID, SECURE_DFU_SERVICE_UUID, find_any_device, DfuException
 
 class AsyncHelper:
     def __init__(self):
@@ -312,7 +312,7 @@ class DfuApp:
                 self.log(f"Scanning for Bootloader... (attempt {attempt + 1}/{scan_attempts})")
                 try:
                     bootloader_device = await find_any_device(
-                        bootloader_identifiers, service_uuid=DFU_SERVICE_UUID)
+                        bootloader_identifiers, service_uuids=[DFU_SERVICE_UUID, SECURE_DFU_SERVICE_UUID])
                     break
                 except DfuException:
                     if attempt < scan_attempts - 1:
