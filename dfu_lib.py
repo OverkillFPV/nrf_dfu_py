@@ -237,43 +237,40 @@ class NordicLegacyDFU:
                 self._log(f"Timeout ({timeout}s) waiting for response to op={expected_op_code:#02x}", logging.ERROR)
                 return -1
 
-    async def jump_to_bootloader(self, device: BLEDevice, max_retries: int = 3):
-        for attempt in range(max_retries):
-            self._log(f"Connecting to {device.name} ({device.address}) for Jump (attempt {attempt+1}/{max_retries})...")
+    async def jump_to_bootloader(self, device: BLEDevice):
+        self._log(f"Connecting to {device.name} ({device.address}) for Jump...")
+        write_attempted = False
+        try:
+            client = BleakClient(device, timeout=20.0, adapter=self.adapter)
+            await client.connect()
+            self._log("Connected. Sending jump command...")
+
             try:
-                client = BleakClient(device, timeout=20.0, adapter=self.adapter)
-                await client.connect()
-                self._log("Connected. Sending jump command...")
-
                 await client.start_notify(DFU_CONTROL_POINT_UUID, self._notification_handler)
+            except Exception:
+                pass  # Notifications are optional for the jump — write alone triggers reboot
 
-                payload = bytearray([OP_CODE_ENTER_BOOTLOADER, UPLOAD_MODE_APPLICATION])
-                logger.debug(f">> TX Jump: {payload.hex()}")
-                try:
-                    await client.write_gatt_char(DFU_CONTROL_POINT_UUID, payload, response=True)
-                except Exception:
-                    pass  # Device may disconnect mid-write — that means jump succeeded
+            payload = bytearray([OP_CODE_ENTER_BOOTLOADER, UPLOAD_MODE_APPLICATION])
+            logger.debug(f">> TX Jump: {payload.hex()}")
+            write_attempted = True
+            try:
+                await client.write_gatt_char(DFU_CONTROL_POINT_UUID, payload, response=True)
+            except Exception:
+                pass  # Device may disconnect mid-write — that means jump succeeded
 
-                # Don't wait for notification — Android doesn't either.
-                # The device reboots into bootloader immediately.
-                self._log("Jump command sent. Device rebooting...")
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass  # Already disconnected
-                return  # Success
+            self._log("Jump command sent. Device rebooting...")
+            try:
+                await client.disconnect()
+            except Exception:
+                pass  # Already disconnected
 
-            except Exception as e:
-                err = str(e).lower()
-                # A disconnect/reset mid-command means the jump worked
-                if any(k in err for k in ("disconnect", "reset", "closed", "not connected")):
-                    self._log("Device disconnected during jump — reboot triggered.")
-                    return
-                self._log(f"Jump attempt {attempt+1} failed: {e}", logging.WARNING)
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2.0)
-                else:
-                    self._log("Could not send jump command. Will still scan for bootloader.", logging.WARNING)
+        except Exception as e:
+            if write_attempted:
+                # Write was sent — device likely rebooted causing this exception
+                self._log(f"Device disconnected after jump command (expected): {e}")
+            else:
+                self._log(f"Jump connection failed: {e}", logging.WARNING)
+                self._log("Will still scan for bootloader (device may already be in DFU mode).", logging.WARNING)
 
     async def perform_update(self, device: BLEDevice, max_retries: int = 3):
         self._log(f"Target Bootloader: {device.address}")
