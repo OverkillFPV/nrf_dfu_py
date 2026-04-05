@@ -304,6 +304,10 @@ class NordicLegacyDFU:
                     raise
 
     async def jump_to_bootloader(self, device: BLEDevice):
+        """Attempt to jump the device into bootloader mode.
+        Returns True if the device is already in bootloader mode (skip scan, use this device directly).
+        Returns False if a jump was sent (caller should scan for the new bootloader device).
+        """
         self._log(f"Connecting to {device.name} ({device.address}) for Jump...")
         write_attempted = False
         try:
@@ -315,6 +319,23 @@ class NordicLegacyDFU:
 
             logger.debug(f"Characteristics: {char_uuids}")
 
+            # --- Check if device is ALREADY in bootloader mode ---
+            # Android: LegacyDfuImpl checks for 1531+1532, SecureDfuImpl checks for 8ec90001+8ec90002
+            legacy_bootloader = (DFU_CONTROL_POINT_UUID.lower() in char_uuids and
+                                 DFU_PACKET_UUID.lower() in char_uuids)
+            secure_bootloader = (SECURE_DFU_CONTROL_POINT_UUID.lower() in char_uuids and
+                                 SECURE_DFU_PACKET_UUID.lower() in char_uuids)
+
+            if legacy_bootloader or secure_bootloader:
+                mode = "Legacy" if legacy_bootloader else "Secure"
+                self._log(f"Device is already in {mode} DFU bootloader mode. Skipping jump.")
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                return True  # Already in bootloader — use this device directly
+
+            # --- Detect which buttonless variant to use for the jump ---
             jump_char = None
             jump_payload = None
             jump_type = None
@@ -333,16 +354,17 @@ class NordicLegacyDFU:
                 jump_payload = bytearray([0x01])
                 jump_type = "Secure Buttonless (no bonds, SDK 13+)"
                 use_indications = True
-            # 3. Legacy DFU Buttonless (SDK 6.1-11) — uses notifications
-            elif DFU_CONTROL_POINT_UUID.lower() in char_uuids:
-                jump_char = DFU_CONTROL_POINT_UUID
-                jump_payload = bytearray([OP_CODE_ENTER_BOOTLOADER, UPLOAD_MODE_APPLICATION])
-                jump_type = "Legacy Buttonless (SDK 6.1-11)"
-            # 4. Experimental Buttonless (SDK 12.x) — uses notifications
+            # 3. Experimental Buttonless (SDK 12.x) — uses notifications
             elif BUTTONLESS_EXPERIMENTAL_UUID.lower() in char_uuids:
                 jump_char = BUTTONLESS_EXPERIMENTAL_UUID
                 jump_payload = bytearray([0x01])
                 jump_type = "Experimental Buttonless (SDK 12.x)"
+            # 4. Legacy DFU Buttonless (SDK 6.1-11) — uses notifications
+            # Only if 1531 is present WITHOUT 1532 (1532 = already in bootloader, handled above)
+            elif DFU_CONTROL_POINT_UUID.lower() in char_uuids:
+                jump_char = DFU_CONTROL_POINT_UUID
+                jump_payload = bytearray([OP_CODE_ENTER_BOOTLOADER, UPLOAD_MODE_APPLICATION])
+                jump_type = "Legacy Buttonless (SDK 6.1-11)"
 
             if not jump_char:
                 self._log("No buttonless DFU characteristic found. Device may already be in bootloader mode.", logging.WARNING)
@@ -350,7 +372,7 @@ class NordicLegacyDFU:
                     await client.disconnect()
                 except Exception:
                     pass
-                return
+                return True  # Assume already in bootloader
 
             self._log(f"Detected: {jump_type}")
 
