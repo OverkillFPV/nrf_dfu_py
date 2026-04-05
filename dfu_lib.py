@@ -256,13 +256,46 @@ class NordicLegacyDFU:
                 self._log(f"Timeout ({timeout}s) waiting for response to op={expected_op_code:#02x}", logging.ERROR)
                 return -1
 
+    async def _connect_with_retry(self, device, max_retries=3):
+        """Connect to a device with retries, handling BlueZ cache issues on Linux."""
+        for attempt in range(max_retries):
+            try:
+                client = BleakClient(device, timeout=30.0, adapter=self.adapter)
+                await client.connect()
+                # Verify services were discovered
+                if not client.services or len(list(client.services)) == 0:
+                    raise BleakError("No services discovered")
+                return client
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    self._log(f"Connection attempt {attempt+1} failed: {e}. Retrying...", logging.WARNING)
+                    # On Linux/BlueZ, clear the device cache between retries
+                    try:
+                        if hasattr(client, '_backend') and hasattr(client._backend, '_bus'):
+                            import subprocess
+                            addr = device.address
+                            path = f"/org/bluez/hci0/dev_{addr.replace(':', '_')}"
+                            subprocess.run(["dbus-send", "--system", "--dest=org.bluez",
+                                            "--type=method_call", path,
+                                            "org.bluez.Device1.Connect"], timeout=5,
+                                           capture_output=True)
+                            await asyncio.sleep(1.0)
+                            subprocess.run(["dbus-send", "--system", "--dest=org.bluez",
+                                            "--type=method_call", path,
+                                            "org.bluez.Device1.Disconnect"], timeout=5,
+                                           capture_output=True)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(2.0)
+                else:
+                    raise
+
     async def jump_to_bootloader(self, device: BLEDevice):
         self._log(f"Connecting to {device.name} ({device.address}) for Jump...")
         write_attempted = False
         try:
-            client = BleakClient(device, timeout=20.0, adapter=self.adapter)
-            await client.connect()
-            self._log("Connected. Discovering services...")
+            client = await self._connect_with_retry(device)
+            self._log("Connected. Services discovered.")
 
             services = client.services
             char_uuids = [c.uuid.lower() for s in services for c in s.characteristics]
@@ -385,7 +418,8 @@ class NordicLegacyDFU:
             self._log(f"DFU connection attempt {attempt+1}/{max_retries}...")
 
             try:
-                async with BleakClient(device, timeout=20.0, adapter=self.adapter) as client:
+                client = await self._connect_with_retry(device)
+                async with client:
                     self.client = client
 
                     await client.start_notify(DFU_CONTROL_POINT_UUID, self._notification_handler)
